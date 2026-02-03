@@ -17,8 +17,16 @@ pyhop.declare_methods('produce', produce)
 
 def make_method(name, rule):
 	def method(state, ID):
-		# your code here
-		pass
+		# A method expands "produce_<item>" into the steps required by this recipe.
+		# We don't check for resources here; we instead add "have_enough" subtasks
+		# so the planner will figure out how to obtain them.
+		subtasks = []
+		for item, num in rule.get('Requires', {}).items():
+			subtasks.append(('have_enough', ID, item, num))
+		for item, num in rule.get('Consumes', {}).items():
+			subtasks.append(('have_enough', ID, item, num))
+		subtasks.append(('op_{}'.format(name.replace(' ', '_')), ID))
+		return subtasks
 
 	return method
 
@@ -26,27 +34,83 @@ def declare_methods(data):
 	# some recipes are faster than others for the same product even though they might require extra tools
 	# sort the recipes so that faster recipes go first
 
-	# your code here
-	# hint: call make_method, then declare the method to pyhop using pyhop.declare_methods('foo', m1, m2, ..., mk)	
-	pass			
+	recipe_order = {}
+	for recipe_name, rule in data['Recipes'].items():
+		for product in rule['Produces'].keys():
+			recipe_order.setdefault(product, []).append((recipe_name, rule))
 
-def make_operator(rule):
+	for product, recipes in recipe_order.items():
+		recipes.sort(key=lambda recipe: recipe[1]['Time'])
+		methods = []
+		for recipe_name, rule in recipes:
+			method = make_method(recipe_name, rule)
+			# Give the method a descriptive name for debugging/printing clarity.
+			method.__name__ = 'method_{}'.format(recipe_name.replace(' ', '_'))
+			methods.append(method)
+		pyhop.declare_methods('produce_{}'.format(product), *methods)
+	# hint: call make_method, then declare the method to pyhop using pyhop.declare_methods('foo', m1, m2, ..., mk)	
+					
+
+def make_operator(name, rule):
 	def operator(state, ID):
-		# your code here
-		pass
+		# Operators are the primitive actions that mutate the state.
+		if state.time[ID] < rule['Time']:
+			return False
+		for item, num in rule.get('Requires', {}).items():
+			if getattr(state, item)[ID] < num:
+				return False
+		for item, num in rule.get('Consumes', {}).items():
+			if getattr(state, item)[ID] < num:
+				return False
+		state.time[ID] -= rule['Time']
+		for item, num in rule.get('Consumes', {}).items():
+			getattr(state, item)[ID] -= num
+		for item, num in rule.get('Produces', {}).items():
+			getattr(state, item)[ID] += num
+		return state
+	operator.__name__ = 'op_{}'.format(name.replace(' ', '_'))
 	return operator
 
 def declare_operators(data):
-	# your code here
+	operators = []
+	for recipe_name, rule in data['Recipes'].items():
+		operators.append(make_operator(recipe_name, rule))
+	pyhop.declare_operators(*operators)
 	# hint: call make_operator, then declare the operator to pyhop using pyhop.declare_operators(o1, o2, ..., ok)
-	pass
 
 def add_heuristic(data, ID):
 	# prune search branch if heuristic() returns True
 	# do not change parameters to heuristic(), but can add more heuristic functions with the same parameters: 
 	# e.g. def heuristic2(...); pyhop.add_check(heuristic2)
+	producible = set()
+	for rule in data['Recipes'].values():
+		producible.update(rule['Produces'].keys())
+	tools = set(data.get('Tools', []))
+
 	def heuristic(state, curr_task, tasks, plan, depth, calling_stack):
-		# your code here
+		# If time goes negative, the plan is invalid.
+		if state.time[ID] < 0:
+			return True
+		# Prevent obvious recursion cycles (e.g., trying to produce the same task again).
+		if curr_task in calling_stack:
+			return True
+		if isinstance(curr_task, tuple):
+			task_name = curr_task[0]
+			if task_name == 'have_enough':
+				item = curr_task[2]
+				required = curr_task[3]
+				# If we need more of an item and no recipe can produce it, prune.
+				if getattr(state, item)[ID] < required and item not in producible:
+					return True
+			elif task_name == 'produce':
+				item = curr_task[2]
+				# Tools aren't consumed; avoid crafting duplicates.
+				if item in tools and getattr(state, item)[ID] >= 1:
+					return True
+			elif task_name.startswith('produce_'):
+				item = task_name.replace('produce_', '', 1)
+				if item in tools and getattr(state, item)[ID] >= 1:
+					return True
 		return False # if True, prune this branch
 
 	pyhop.add_check(heuristic)
