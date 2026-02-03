@@ -6,6 +6,8 @@ def check_enough(state, ID, item, num):
 	return False
 
 def produce_enough(state, ID, item, num):
+	if item == 'ingot':
+		return [('produce_ingot', ID)] * num + [('have_enough', ID, item, num)]
 	return [('produce', ID, item), ('have_enough', ID, item, num)]
 
 pyhop.declare_methods('have_enough', check_enough, produce_enough)
@@ -25,9 +27,13 @@ def make_method(name, rule):
 			subtasks.append(('have_enough', ID, item, num))
 		for item, num in rule.get('Consumes', {}).items():
 			subtasks.append(('have_enough', ID, item, num))
+		ingot_tasks = [task for task in subtasks if task[2] == 'ingot']
+		other_tasks = [task for task in subtasks if task[2] != 'ingot']
+		subtasks = other_tasks + ingot_tasks
 		subtasks.append(('op_{}'.format(name.replace(' ', '_')), ID))
 		return subtasks
 
+	method._recipe_time = rule.get('Time', 0)
 	return method
 
 def declare_methods(data):
@@ -67,6 +73,8 @@ def make_operator(name, rule):
 			getattr(state, item)[ID] -= num
 		for item, num in rule.get('Produces', {}).items():
 			getattr(state, item)[ID] += num
+			if item in data.get('Tools', []):
+				state.made_tools[ID].add(item)
 		return state
 	operator.__name__ = 'op_{}'.format(name.replace(' ', '_'))
 	return operator
@@ -86,31 +94,104 @@ def add_heuristic(data, ID):
 	for rule in data['Recipes'].values():
 		producible.update(rule['Produces'].keys())
 	tools = set(data.get('Tools', []))
+	goal_items = set(data.get('Problem', {}).get('Goal', {}).keys())
+	disallowed_tools = {
+		tool for tool in tools
+		if tool not in goal_items and (tool.startswith('iron_') or tool.endswith('_axe'))
+	}
+	min_unit_time = {}
+	for rule in data['Recipes'].values():
+		if any(item in disallowed_tools for item in rule.get('Requires', {}).keys()):
+			continue
+		rule_time = rule['Time']
+		for product, qty in rule['Produces'].items():
+			unit_time = rule_time / qty
+			current = min_unit_time.get(product)
+			if current is None or unit_time < current:
+				min_unit_time[product] = unit_time
+	inventory_keys = list(data.get('Items', [])) + list(data.get('Tools', []))
+	best_time = {}
+	axes = {tool for tool in tools if tool.endswith('_axe')}
 
 	def heuristic(state, curr_task, tasks, plan, depth, calling_stack):
 		# If time goes negative, the plan is invalid.
 		if state.time[ID] < 0:
 			return True
-		# Prevent obvious recursion cycles (e.g., trying to produce the same task again).
-		if curr_task in calling_stack:
+		state_key = (curr_task, tuple(tasks), tuple(getattr(state, item)[ID] for item in inventory_keys))
+		remaining_time = state.time[ID]
+		previous_best = best_time.get(state_key)
+		if previous_best is not None and remaining_time <= previous_best:
 			return True
+		best_time[state_key] = remaining_time
 		if isinstance(curr_task, tuple):
 			task_name = curr_task[0]
-			if task_name == 'have_enough':
+			if task_name == 'produce':
+				item = curr_task[2]
+				if curr_task in calling_stack and item in tools:
+					return True
+			elif task_name == 'have_enough':
 				item = curr_task[2]
 				required = curr_task[3]
 				# If we need more of an item and no recipe can produce it, prune.
 				if getattr(state, item)[ID] < required and item not in producible:
+					return True
+				if item in disallowed_tools and getattr(state, item)[ID] < required:
 					return True
 			elif task_name == 'produce':
 				item = curr_task[2]
 				# Tools aren't consumed; avoid crafting duplicates.
 				if item in tools and getattr(state, item)[ID] >= 1:
 					return True
+				if item in tools and item in state.made_tools[ID]:
+					return True
+				if item in tools and item.startswith('iron_') and item not in goal_items:
+					return True
+				if item in tools and item.endswith('_axe') and item not in goal_items:
+					return True
 			elif task_name.startswith('produce_'):
 				item = task_name.replace('produce_', '', 1)
+				if curr_task in calling_stack and item in tools:
+					return True
 				if item in tools and getattr(state, item)[ID] >= 1:
 					return True
+				if item in tools and item in state.made_tools[ID]:
+					return True
+				if item in tools and item.startswith('iron_') and item not in goal_items:
+					return True
+				if item in tools and item.endswith('_axe') and item not in goal_items:
+					return True
+				if item in axes:
+					wood_needed = 0
+					for task in (curr_task,) + tuple(tasks):
+						if not isinstance(task, tuple):
+							continue
+						if task[0] == 'have_enough' and task[2] == 'wood':
+							wood_needed = max(wood_needed, task[3] - getattr(state, 'wood')[ID])
+						elif task[0] == 'produce_wood':
+							wood_needed = max(wood_needed, 1 - getattr(state, 'wood')[ID])
+					if wood_needed <= 0 and 'wood' not in goal_items:
+						return True
+		estimated_time = 0.0
+		for task in (curr_task,) + tuple(tasks):
+			if not isinstance(task, tuple):
+				continue
+			task_name = task[0]
+			if task_name == 'have_enough':
+				item = task[2]
+				required = task[3]
+				if item in min_unit_time:
+					deficit = max(0, required - getattr(state, item)[ID])
+					estimated_time += deficit * min_unit_time[item]
+			elif task_name == 'produce':
+				item = task[2]
+				if item in min_unit_time:
+					estimated_time += min_unit_time[item]
+			elif task_name.startswith('produce_'):
+				item = task_name.replace('produce_', '', 1)
+				if item in min_unit_time:
+					estimated_time += min_unit_time[item]
+		if estimated_time > state.time[ID]:
+			return True
 		return False # if True, prune this branch
 
 	pyhop.add_check(heuristic)
@@ -118,14 +199,95 @@ def add_heuristic(data, ID):
 def define_ordering(data, ID):
 	# if needed, use the function below to return a different ordering for the methods
 	# note that this should always return the same methods, in a new order, and should not add/remove any new ones
+	tools = set(data.get('Tools', []))
+	goal_items = set(data.get('Problem', {}).get('Goal', {}).keys())
+	disallowed_tools = {
+		tool for tool in tools
+		if tool not in goal_items and (tool.startswith('iron_') or tool.endswith('_axe'))
+	}
+	min_unit_time = {}
+	for rule in data['Recipes'].values():
+		if any(item in disallowed_tools for item in rule.get('Requires', {}).keys()):
+			continue
+		rule_time = rule['Time']
+		for product, qty in rule['Produces'].items():
+			unit_time = rule_time / qty
+			current = min_unit_time.get(product)
+			if current is None or unit_time < current:
+				min_unit_time[product] = unit_time
+	tool_tiers = {
+		'wooden': 1,
+		'stone': 2,
+		'iron': 3,
+	}
+
 	def reorder_methods(state, curr_task, tasks, plan, depth, calling_stack, methods):
-		return methods
+		scored_methods = []
+		target_item = None
+		if isinstance(curr_task, tuple) and curr_task[0].startswith('produce_'):
+			target_item = curr_task[0].replace('produce_', '', 1)
+		preferred_tool = None
+		if target_item == 'cobble':
+			if getattr(state, 'stone_pickaxe')[ID] > 0:
+				preferred_tool = 'stone_pickaxe'
+			elif getattr(state, 'wooden_pickaxe')[ID] > 0:
+				preferred_tool = 'wooden_pickaxe'
+			else:
+				preferred_tool = 'wooden_pickaxe'
+		elif target_item in {'coal', 'ore'}:
+			if getattr(state, 'iron_pickaxe')[ID] > 0:
+				preferred_tool = 'iron_pickaxe'
+			elif getattr(state, 'stone_pickaxe')[ID] > 0:
+				preferred_tool = 'stone_pickaxe'
+			else:
+				preferred_tool = 'stone_pickaxe'
+		for method in methods:
+			subtasks = pyhop.get_subtasks(method, state, curr_task)
+			missing_tools = 0
+			missing_items = 0
+			required_tool_tier = 0
+			recipe_time = getattr(method, '_recipe_time', 0)
+			requires_stone_pickaxe = False
+			estimated_time = 0.0
+			method_tool = None
+			for subtask in subtasks:
+				if subtask[0] != 'have_enough':
+					continue
+				item = subtask[2]
+				required = subtask[3]
+				available = getattr(state, item)[ID]
+				if available < required:
+					if item in tools:
+						missing_tools += 1
+					else:
+						missing_items += 1
+					if item in min_unit_time:
+						estimated_time += (required - available) * min_unit_time[item]
+				if item in tools:
+					tier_name = item.split('_', 1)[0]
+					required_tool_tier = max(required_tool_tier, tool_tiers.get(tier_name, 4))
+					if method_tool is None:
+						method_tool = item
+				if item == 'stone_pickaxe':
+					requires_stone_pickaxe = True
+			if preferred_tool is None:
+				prefer_flag = 0 if method_tool is None else 1
+			else:
+				prefer_flag = 0 if method_tool == preferred_tool else 1
+			if missing_tools == 0:
+				score = (prefer_flag, missing_items, estimated_time, recipe_time, len(subtasks))
+			else:
+				score = (prefer_flag, missing_tools, required_tool_tier, missing_items, estimated_time, recipe_time, len(subtasks))
+			scored_methods.append((score, method))
+		scored_methods.sort(key=lambda entry: entry[0])
+		return [method for _, method in scored_methods]
 	
 	pyhop.define_ordering(reorder_methods)
 
 def set_up_state(data, ID):
 	state = pyhop.State('state')
 	setattr(state, 'time', {ID: data['Problem']['Time']})
+	setattr(state, 'made_tools', {ID: set()})
 
 	for item in data['Items']:
 		setattr(state, item, {ID: 0})
